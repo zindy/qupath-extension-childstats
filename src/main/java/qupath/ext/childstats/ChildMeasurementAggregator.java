@@ -1,5 +1,7 @@
 package qupath.ext.childstats;
 
+import qupath.lib.gui.measure.ObservableMeasurementTableData;
+import qupath.lib.images.ImageData;
 import qupath.lib.objects.PathCellObject;
 import qupath.lib.objects.PathObject;
 import qupath.lib.objects.classes.PathClass;
@@ -19,8 +21,15 @@ import java.util.stream.Collectors;
  * measurements rolled up to its parent annotation) and writes the results
  * as new measurements on the parent.
  * <p>
- * Deliberately has no GUI or JavaFX dependency: it is safe to call from a
- * script, a headless batch job, or the extension's dialog. Progress
+ * Values are resolved via {@link ObservableMeasurementTableData} - the same model
+ * QuPath's own Annotations-tab table uses - rather than a child's raw
+ * {@code getMeasurementList()}. This matters: things like Area, Perimeter, and any
+ * {@code Num <class>} count are <i>dynamically computed</i> for annotations, not
+ * stored, so a plain measurement-list lookup would never see them. This does mean
+ * an {@link ImageData} must be supplied to every call - unlike
+ * {@code ObservableMeasurementTableData} itself, this class has no JavaFX Application
+ * Thread or {@code Stage} dependency though, so it remains safe to call from a
+ * script or a headless batch job, not just the extension's dialog. Progress
  * reporting, if wanted, is injected via an {@link IntConsumer} rather than
  * baked in, so GUI code can wrap a run in a progress dialog while script
  * code can simply omit it.
@@ -49,13 +58,95 @@ public class ChildMeasurementAggregator {
     }
 
     private final Class<? extends PathObject> childType;
-    private final PathClass childClass; // null = any class
+    private final ClassFilter childClass; // never null; ClassFilter.any() is the default
     private final List<String> measurementNames;
     private final Set<Stat> stats;
     private final double percentile; // used only if stats contains PERCENTILE, in [0, 100]
     private final String nameFormat; // formatted with (measurementName, statLabel)
     private final boolean overwrite;
     private final MissingPolicy missingPolicy;
+
+    /**
+     * What a child's classification must satisfy to be included. Kept as an explicit
+     * three-way choice - rather than overloading {@code null} to mean "any class" - because
+     * once children can themselves be annotations (nested annotation structures), "no filter"
+     * and "only unclassified children" are genuinely different things a user might want, and
+     * a bare {@code PathClass} can't represent both unambiguously. Classification never
+     * determines parent vs. child role either way - {@link PathObject#getChildObjects()}
+     * (tree position) does - so this filter only narrows which of a parent's direct children
+     * qualify, regardless of what type the parent itself is.
+     */
+    public static final class ClassFilter {
+        private enum Kind { ANY, UNCLASSIFIED, SPECIFIC }
+
+        private static final ClassFilter ANY = new ClassFilter(Kind.ANY, null);
+        private static final ClassFilter UNCLASSIFIED = new ClassFilter(Kind.UNCLASSIFIED, null);
+
+        private final Kind kind;
+        private final PathClass pathClass;
+
+        private ClassFilter(Kind kind, PathClass pathClass) {
+            this.kind = kind;
+            this.pathClass = pathClass;
+        }
+
+        /** No restriction - every child qualifies, classified or not. */
+        public static ClassFilter any() {
+            return ANY;
+        }
+
+        /** Only children with no classification at all ({@code getPathClass() == null}). */
+        public static ClassFilter unclassified() {
+            return UNCLASSIFIED;
+        }
+
+        /** Only children classified exactly as {@code pathClass}. */
+        public static ClassFilter of(PathClass pathClass) {
+            return new ClassFilter(Kind.SPECIFIC, Objects.requireNonNull(pathClass));
+        }
+
+        public boolean matches(PathClass candidate) {
+            return switch (kind) {
+                case ANY -> true;
+                case UNCLASSIFIED -> candidate == null;
+                case SPECIFIC -> pathClass.equals(candidate);
+            };
+        }
+
+        /** The classification to match, for {@link #of}; {@code null} for {@link #any()}/{@link #unclassified()}. */
+        public PathClass getPathClass() {
+            return pathClass;
+        }
+
+        public boolean isSpecific() {
+            return kind == Kind.SPECIFIC;
+        }
+
+        public boolean isUnclassified() {
+            return kind == Kind.UNCLASSIFIED;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof ClassFilter other)) return false;
+            return kind == other.kind && Objects.equals(pathClass, other.pathClass);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(kind, pathClass);
+        }
+
+        @Override
+        public String toString() {
+            return switch (kind) {
+                case ANY -> "(All classes)";
+                case UNCLASSIFIED -> "(Unclassified)";
+                case SPECIFIC -> pathClass.toString();
+            };
+        }
+    }
 
     private ChildMeasurementAggregator(Builder b) {
         this.childType = b.childType;
@@ -76,12 +167,14 @@ public class ChildMeasurementAggregator {
      * Compute aggregate measurements for a single parent object and write them
      * to its measurement list.
      *
+     * @param imageData the image the parent belongs to - needed to resolve dynamically
+     *                   computed measurements (e.g. Area, Num &lt;class&gt;) on the children
      * @param parent the object whose children will be summarised
      * @return one result per (measurement, stat) pair that was actually written;
      *         empty if the parent has no qualifying children
      */
-    public List<AggregationResult> apply(PathObject parent) {
-        return compute(parent, true);
+    public List<AggregationResult> apply(ImageData<?> imageData, PathObject parent) {
+        return compute(imageData, parent, true);
     }
 
     /**
@@ -89,28 +182,35 @@ public class ChildMeasurementAggregator {
      * writing anything - for the dialog's "Preview" action, so a user can check
      * the numbers before committing to a run that mutates every annotation.
      *
+     * @param imageData the image the parent belongs to
      * @param parent the object whose children will be summarised
      * @return one result per (measurement, stat) pair that would be written
      */
-    public List<AggregationResult> preview(PathObject parent) {
-        return compute(parent, false);
+    public List<AggregationResult> preview(ImageData<?> imageData, PathObject parent) {
+        return compute(imageData, parent, false);
     }
 
-    private List<AggregationResult> compute(PathObject parent, boolean write) {
+    private List<AggregationResult> compute(ImageData<?> imageData, PathObject parent, boolean write) {
         var children = parent.getChildObjects().stream()
                 .filter(childType::isInstance)
-                .filter(c -> childClass == null || childClass.equals(c.getPathClass()))
+                .filter(c -> childClass.matches(c.getPathClass()))
                 .toList();
 
         var results = new ArrayList<AggregationResult>();
         if (children.isEmpty())
             return results;
 
+        // Resolve values the same way QuPath's own Annotations-tab table does, so this sees
+        // both stored measurements and dynamically computed ones (Area, Perimeter, Num <class>,
+        // ...) identically - a raw getMeasurementList() lookup only ever sees the former.
+        var table = new ObservableMeasurementTableData();
+        table.setImageData(imageData, children);
+
         var parentMeasurements = parent.getMeasurementList();
 
         for (var measurementName : measurementNames) {
             var values = children.stream()
-                    .mapToDouble(c -> c.getMeasurementList().get(measurementName))
+                    .mapToDouble(c -> table.getNumericValue(c, measurementName))
                     .filter(v -> !Double.isNaN(v) && !Double.isInfinite(v))
                     .toArray();
 
@@ -146,24 +246,25 @@ public class ChildMeasurementAggregator {
     }
 
     /**
-     * Run over several parent objects.
+     * Run over several parent objects, all belonging to the given image.
      *
+     * @param imageData the image the parents belong to
      * @param parents  objects to process
      * @param progress optional callback invoked with the number of parents processed
      *                 so far (1-indexed); may be {@code null}
      */
-    public void runOn(Collection<? extends PathObject> parents, IntConsumer progress) {
+    public void runOn(ImageData<?> imageData, Collection<? extends PathObject> parents, IntConsumer progress) {
         int done = 0;
         for (var parent : parents) {
-            apply(parent);
+            apply(imageData, parent);
             done++;
             if (progress != null)
                 progress.accept(done);
         }
     }
 
-    public void runOn(Collection<? extends PathObject> parents) {
-        runOn(parents, null);
+    public void runOn(ImageData<?> imageData, Collection<? extends PathObject> parents) {
+        runOn(imageData, parents, null);
     }
 
     private double compute(Stat stat, double[] values) {
@@ -241,9 +342,12 @@ public class ChildMeasurementAggregator {
         var sb = new StringBuilder();
         sb.append("qupath.ext.childstats.ChildMeasurementAggregator.builder()\n");
         sb.append("    .childType(").append(childType.getName()).append(".class)\n");
-        if (childClass != null)
-            sb.append("    .childClass(qupath.lib.objects.classes.PathClass.fromString(\"")
-                    .append(childClass.toString().replace("\"", "\\\"")).append("\"))\n");
+        if (childClass.isSpecific())
+            sb.append("    .childClass(qupath.ext.childstats.ChildMeasurementAggregator.ClassFilter.of(")
+                    .append("qupath.lib.objects.classes.PathClass.fromString(\"")
+                    .append(childClass.getPathClass().toString().replace("\"", "\\\"")).append("\")))\n");
+        else if (childClass.isUnclassified())
+            sb.append("    .childClass(qupath.ext.childstats.ChildMeasurementAggregator.ClassFilter.unclassified())\n");
         sb.append("    .measurements(")
                 .append(measurementNames.stream()
                         .map(n -> "\"" + n.replace("\"", "\\\"") + "\"")
@@ -261,7 +365,7 @@ public class ChildMeasurementAggregator {
         sb.append("    .onMissing(qupath.ext.childstats.ChildMeasurementAggregator.MissingPolicy.")
                 .append(missingPolicy).append(")\n");
         sb.append("    .build()\n");
-        sb.append("    .runOn(getAnnotationObjects())\n");
+        sb.append("    .runOn(getCurrentImageData(), getAnnotationObjects())\n");
         sb.append("\nfireHierarchyUpdate()");
         return sb.toString();
     }
@@ -285,7 +389,7 @@ public class ChildMeasurementAggregator {
 
     public static final class Builder {
         private Class<? extends PathObject> childType = PathCellObject.class;
-        private PathClass childClass = null;
+        private ClassFilter childClass = ClassFilter.any();
         private final List<String> measurementNames = new ArrayList<>();
         private final Set<Stat> stats = EnumSet.noneOf(Stat.class);
         private double percentile = 90.0;
@@ -298,9 +402,9 @@ public class ChildMeasurementAggregator {
             return this;
         }
 
-        /** Restrict to children with this exact classification; {@code null} (the default) means any class. */
-        public Builder childClass(PathClass childClass) {
-            this.childClass = childClass;
+        /** Restrict to children matching this filter; default is {@link ClassFilter#any()}. */
+        public Builder childClass(ClassFilter childClass) {
+            this.childClass = Objects.requireNonNull(childClass);
             return this;
         }
 

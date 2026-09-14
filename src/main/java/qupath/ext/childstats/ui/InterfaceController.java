@@ -26,6 +26,7 @@ import qupath.ext.childstats.ChildMeasurementAggregator.AggregationResult;
 import qupath.ext.childstats.ChildMeasurementAggregator.MissingPolicy;
 import qupath.ext.childstats.ChildMeasurementAggregator.Stat;
 import qupath.fx.dialogs.Dialogs;
+import qupath.lib.gui.measure.ObservableMeasurementTableData;
 import qupath.lib.images.ImageData;
 import qupath.lib.objects.PathAnnotationObject;
 import qupath.lib.objects.PathCellObject;
@@ -64,7 +65,8 @@ public class InterfaceController extends VBox {
     private enum ChildTypeOption {
         CELLS("Cells", PathCellObject.class),
         DETECTIONS("Detections", PathDetectionObject.class),
-        TILES("Tiles", PathTileObject.class);
+        TILES("Tiles", PathTileObject.class),
+        ANNOTATIONS("Annotations", PathAnnotationObject.class);
 
         private final String label;
         private final Class<? extends PathObject> type;
@@ -81,7 +83,7 @@ public class InterfaceController extends VBox {
     }
 
     @FXML private ComboBox<ChildTypeOption> childTypeCombo;
-    @FXML private ComboBox<PathClass> childClassCombo;
+    @FXML private ComboBox<ChildMeasurementAggregator.ClassFilter> childClassCombo;
 
     @FXML private TextField measurementFilterField;
     @FXML private ListView<String> availableList;
@@ -122,7 +124,7 @@ public class InterfaceController extends VBox {
     // what's already picked on the right
     private final ObservableList<String> allMeasurementNames = FXCollections.observableArrayList();
     private final ObservableList<String> selectedNames = FXCollections.observableArrayList();
-    private final ObservableList<PathClass> allChildClasses = FXCollections.observableArrayList();
+    private final ObservableList<ChildMeasurementAggregator.ClassFilter> allChildClasses = FXCollections.observableArrayList();
 
     public static InterfaceController createInstance() throws IOException {
         return new InterfaceController();
@@ -154,20 +156,12 @@ public class InterfaceController extends VBox {
     private void setupChildTypeAndClass() {
         childTypeCombo.setItems(FXCollections.observableArrayList(ChildTypeOption.values()));
         childTypeCombo.getSelectionModel().select(ChildTypeOption.CELLS);
+        childTypeCombo.setTooltip(new javafx.scene.control.Tooltip(resources.getString("tooltip.childType")));
 
+        // ClassFilter.toString() already gives the right label ("(All classes)", "(Unclassified)",
+        // or the class name), so no custom StringConverter is needed here.
         childClassCombo.setItems(allChildClasses);
-        childClassCombo.setConverter(new StringConverter<>() {
-            @Override
-            public String toString(PathClass pc) {
-                return pc == null ? "(All classes)" : pc.toString();
-            }
-
-            @Override
-            public PathClass fromString(String s) {
-                return null; // combo is not editable; not used
-            }
-        });
-        childClassCombo.getSelectionModel().selectFirst(); // null sentinel is always index 0
+        childClassCombo.getSelectionModel().selectFirst(); // ClassFilter.any() is always index 0
     }
 
     private void setupMeasurementPicker() {
@@ -251,8 +245,8 @@ public class InterfaceController extends VBox {
     private void refreshFromCurrentImage() {
         var imageData = currentImageData();
         var names = new TreeSet<String>();
-        var classes = new LinkedHashSet<PathClass>();
-        classes.add(null); // "All classes" sentinel, always first
+        var specificClasses = new TreeSet<PathClass>(java.util.Comparator.comparing(PathClass::toString));
+        var matchingChildren = new ArrayList<PathObject>();
 
         if (imageData != null) {
             var childType = selectedChildType();
@@ -260,14 +254,30 @@ public class InterfaceController extends VBox {
                 for (var child : annotation.getChildObjects()) {
                     if (!childType.isInstance(child))
                         continue;
-                    classes.add(child.getPathClass());
-                    names.addAll(child.getMeasurementList().getNames());
+                    matchingChildren.add(child);
+                    var pc = child.getPathClass();
+                    if (pc != null)
+                        specificClasses.add(pc);
                 }
+            }
+            if (!matchingChildren.isEmpty()) {
+                // Same lookup ChildMeasurementAggregator itself uses at run time, so what's
+                // offered here always matches what will actually resolve to a number - including
+                // dynamically computed measurements (Area, Perimeter, Num <class>, ...) that
+                // getMeasurementList() alone would never surface.
+                var table = new ObservableMeasurementTableData();
+                table.setImageData(imageData, matchingChildren);
+                names.addAll(table.getMeasurementNames());
             }
         }
 
+        var classFilters = new ArrayList<ChildMeasurementAggregator.ClassFilter>();
+        classFilters.add(ChildMeasurementAggregator.ClassFilter.any());
+        classFilters.add(ChildMeasurementAggregator.ClassFilter.unclassified());
+        specificClasses.forEach(pc -> classFilters.add(ChildMeasurementAggregator.ClassFilter.of(pc)));
+
         allMeasurementNames.setAll(names);
-        allChildClasses.setAll(classes);
+        allChildClasses.setAll(classFilters);
         childClassCombo.getSelectionModel().selectFirst();
         // drop any previously-selected measurements that no longer exist for this child type
         selectedNames.retainAll(names);
@@ -304,8 +314,7 @@ public class InterfaceController extends VBox {
             return;
         }
 
-        previewTable.getItems().setAll(aggregator.preview(selected));
-        logToWorkflow(imageData, aggregator);
+        previewTable.getItems().setAll(aggregator.preview(imageData, selected));
     }
 
     @FXML
@@ -338,7 +347,7 @@ public class InterfaceController extends VBox {
         var task = new Task<Void>() {
             @Override
             protected Void call() {
-                aggregator.runOn(annotations, done -> updateProgress(done, annotations.size()));
+                aggregator.runOn(imageData, annotations, done -> updateProgress(done, annotations.size()));
                 return null;
             }
         };
@@ -384,7 +393,7 @@ public class InterfaceController extends VBox {
                     try {
                         ImageData<BufferedImage> imageData = entry.readImageData();
                         var annotations = imageData.getHierarchy().getAnnotationObjects();
-                        aggregator.runOn(annotations);
+                        aggregator.runOn(imageData, annotations);
                         imageData.getHierarchy().fireHierarchyChangedEvent(this);
                         logToWorkflow(imageData, aggregator);
                         entry.saveImageData(imageData);
