@@ -1,224 +1,102 @@
-# QuPath extension template
+# qupath-extension-childstats
 
-This repo contains a template and instructions to help create a new extension for [QuPath](https://qupath.github.io).
+A [QuPath](https://qupath.github.io) extension that summarises child object
+measurements (e.g. cell morphology and intensity) onto their parent
+annotations. The annotation provides both a GUI and a fluent scripting
+interface.
 
-It already contains two minimal extensions - one using Java, one using Groovy - so the first task is to make sure that they work.
-Then, it's a matter of customizing the code to make it more useful.
+## Why
 
-> **Update!** 
-> For QuPath v0.6.0 this repo switched to use Kotlin DSL for Gradle build files - 
-> and also to use the [QuPath Gradle Plugin](https://github.com/qupath/qupath-gradle-plugin).
-> 
-> The outcome is that the build files are _much_ simpler.
+QuPath computes useful per-object measurements on cells/detections, and
+useful summary statistics for display (counts, percentages) on annotations,
+but there's no built-in GUI way to roll arbitrary child measurements up to
+their parent as new, persisted measurements - e.g. "mean nucleus area of the
+cells in this annotation". This extension adds that as a dialog, backed by a
+small scriptable API so the same aggregation can be called from Groovy or run
+across a whole project.
 
+## Features
 
-## Build the extension
+- Pick a child object type (cells / detections / tiles) and, optionally,
+  restrict to a single classification
+- Two-pane measurement picker (available / selected) with a filter box, so
+  you don't have to hunt through hundreds of measurement names
+- Statistics: mean, std.dev., median, min, max, sum, CV, and an arbitrary
+  percentile
+- Configurable output name format, overwrite behaviour, and a policy for
+  annotations with no valid child values (skip / write 0 / abort)
+- Preview: compute and inspect values for one selected annotation without
+  writing anything
+- Run on the current image, or across every image in the open project
+- Every run logs an equivalent, re-runnable Groovy script to QuPath's
+  **Workflow** tab
 
-Building the extension with Gradle should be pretty easy - you don't even need to install Gradle separately, because the 
-[Gradle Wrapper](https://docs.gradle.org/current/userguide/gradle_wrapper.html) will take care of that.
+## Requirements
 
-Open a command prompt, navigate to where the code lives, and use
+- QuPath 0.7.0 or later
+
+## Installation
+
+1. Download the latest `.jar` from the
+   [Releases](../../releases) page (or build it yourself - see below).
+2. Drag the `.jar` onto a running QuPath window, or copy it into QuPath's
+   extensions directory (**Extensions > Installed extensions... > Open
+   extensions directory**).
+3. Restart QuPath.
+
+The command appears under **Extensions > Child measurement aggregator**.
+It can be toggled off from **Edit > Preferences**, under the extension's own
+preference category.
+
+## Building from source
+
 ```bash
-gradlew build
+git clone https://github.com/zindy/qupath-extension-childstats.git
+cd qupath-extension-childstats
+./gradlew clean build
 ```
 
-The built extension should be found inside `build/libs`.
-You can drag this onto QuPath to install it.
-You'll be prompted to create a user directory if you don't already have one.
+The built extension `.jar` is written to `build/libs/`.
 
-The minimal extension here doesn't do much, but it should at least install a new command under the 'Extensions' menu in 
-QuPath.
+## Usage
 
-> In case your extension contains external dependencies beyond what QuPath already includes, you can create a 
-> [single jar file](https://imperceptiblethoughts.com/shadow/introduction/#benefits-of-shadow) that bundles these along 
-> with your extension by using
-> ```bash
-> gradlew shadowJar
-> ```
-> If you don't do that, you'll need to drag *all* the extra dependences onto QuPath to install them as well.
+1. Open an image (or project) with annotations containing child objects
+   (cells, detections, or tiles) that have measurements.
+2. **Extensions > Child measurement aggregator**.
+3. Choose the child object type and, optionally, a classification to
+   restrict to.
+4. Pick which measurements to summarise and which statistics to compute.
+5. Select an annotation in the viewer and click **Preview** to check the
+   numbers before committing.
+6. Choose to run on the current image or the whole project, then **Run**.
 
+## Scripting
 
-## Configure the extension
+The dialog is a thin wrapper around `ChildMeasurementAggregator`, which has
+no GUI dependency and can be called directly from a script - useful for
+batch processing or for chaining into a larger pipeline:
 
-Edit `build.gradle.kts` to specify the details of your extension
+```groovy
+import qupath.ext.childstats.ChildMeasurementAggregator
 
-```kotlin
-qupathExtension {
-  name = "qupath-extension-template"
-  group = "io.github.qupath"
-  version = releaseVersion
-  description = "A simple QuPath extension"
-  automaticModule = "io.github.qupath.extension.template"
-}
+ChildMeasurementAggregator.builder()
+    .childType(qupath.lib.objects.PathCellObject.class)
+    .measurements("Nucleus: Area", "Cell: Mean DAB OD")
+    .stats(ChildMeasurementAggregator.Stat.MEAN, ChildMeasurementAggregator.Stat.STDEV)
+    .nameFormat("%s : Annotation %s")
+    .build()
+    .runOn(getAnnotationObjects())
+
+fireHierarchyUpdate()
 ```
 
-Edit `settings.gradle.kts` to specify which version of QuPath your extension should be compatible with, e.g.
-
-```kotlin
-qupath {
-    version = "0.6.0"
-}
-```
-
-Unlike in the original template project, here the version is set in a separate [VERSION](VERSION) file rather than in `build.gradle.kts`.
-
-Additionally, a build and publish action is triggered *automatically* in Github if a git tag is pushed and it matches the VERSION (*sans* the `-SNAPSHOT` part). See the modified [build.yml](.github/workflows/build.yml).
-
-To trigger a build and publish action, issue the following commands from your local prompt:
-```
-git tag -a v0.1.0 -m "Release version 0.1.0"
-git push origin v0.1.0
-```
-
-Or from the extension's folder, this bash one-liner:
-```
-VERSION=$(cat VERSION | sed 's/-SNAPSHOT//'); git tag -a "v$VERSION" -m "Release version $VERSION"; git push origin "v$VERSION"
-```
-
-Once the new extension is published, you can increment the VERSION file and initiate an new round of development.
-
-
-
-
-## Run QuPath + the extension
-
-During development, your probably want to run QuPath easily with your extension installed for debugging.
-
-### 0. Make sure you have Java installed
-You'll need to install Java first.
-
-At the time of writing, we use a Java 25 JDK downloaded from https://adoptium.net/
-
-> Java 25 is a 'Long Term Support' release - which is why we use it instead of the very latest version.
-
-### 1. Get QuPath's source code
-You can find instructions at https://qupath.readthedocs.io/en/stable/docs/reference/building.html
-
-### 2. Create an `include-extra` file
-Create a file called `include-extra` in the root directory of the QuPath source code (*not* the extension code!).
-
-Set the contents of this file to:
-```
-[includeBuild]
-/path/to/your/extension
-
-[dependencies]
-extension-group:extension-name
-```
-replacing the default lines where needed.
-
-For example, to build the extension with the names given above you'd use
-```
-[includeBuild]
-../qupath-extension-template
-
-[dependencies]
-io.github.qupath:qupath-extension-template
-```
-
-### 3. Run QuPath
-Run QuPath from the command line using
-```
-gradlew run
-```
-If all goes well, QuPath should launch and you can check the *Extensions* mention to confirm the extension is installed.
-
-
-## Set up in an IDE (optional)
-
-During development, things are likely to be much easier if you work within an IDE.
-
-QuPath itself is developed using IntelliJ, and you can import the extension template there.
-
-The setup process is as above, and you'll need a a [Run configuration](https://www.jetbrains.com/help/idea/run-debug-configuration.html) 
-to call `gradlew run`.
-
-
-## Customize the extension
-
-Now you're ready for the creative part.
-
-You can develop the extension using either Java or Groovy - the template includes examples of both.
-
-### Create the extension Java or Groovy file(s)
-
-For the extension to work, you need to create at least one file that extends `qupath.lib.gui.extensions.QuPathExtension`.
-
-There are two examples in the template, in two languages:
-* **Java:** `qupath.ext.template.DemoExtension.java`.
-* **Groovy:** `qupath.ext.template.DemoGroovyExtension.java`.
-
-You can pick the one that corresponds to the language you want to use, and delete the other.
-
-Then take your chosen file and rename it, edit it, move it to another package... basically, make it your own.
-
-> Please **don't neglect this step!** 
-> If you do, there's a chance of multiple extensions being created with the same class names... and causing confusion later.
-
-### Update the `META-INF/services` file
-
-For QuPath to *find* the extension later, the full class name needs to be available in `resources/META-INFO/services/qupath.lib.gui.extensions.QuPathExtensions`.
-
-So remember to edit that file to include the class name that you actually used for your extension.
-
-### Specify your license
-
-Add a license file to your GitHub repo so that others know what they can and can't do with your extension.
-
-This should be compatible with QuPath's license -- see https://github.com/qupath/qupath
-
-## Repository configuration
-
-### Easy install
-
-If you follow some conventions in naming your extension and making releases, then other QuPath users will find it easy to automatically
-install and update your extension!
-
-First, we suggest you name your extension `qupath-extension-[something]`, and keep it in its own repository (named the same as the extension),
-separate from other projects.
-
-Next, when you want to publish a new version of your extension, use the `github_release.yml` workflow included in this repository.
-
-To do so, you'd need to navigate to `Actions -> Make draft release -> Run workflow -> Run workflow` as shown in the following screenshot:
-
-![Screenshot from 2024-03-14 18-44-42](https://github.com/alanocallaghan/qupath-extension-template/assets/10779688/4712a209-eda7-4f80-8bed-bbab20e4f50a)
-
-This will automatically build the extension, and create a draft release containing the extension jar (and its associated sources and javadoc).
-You can then navigate to `Releases` and fill out information about the release --- the version, any significant changes, etc.
-Once published, users will be able to automatically install the extension as described here:
-https://qupath.readthedocs.io/en/0.5/docs/intro/extensions.html#installing-extensions
-
-### Catalogs
-
-QuPath's extension manager can easily install an extension if it is referenced in a **catalog**.
-A catalog is a JSON file hosted on a GitHub repository containing information about extensions, making it possible to easily manage them from QuPath.
-
-To create a catalog, follow the [extension catalog model documentation](https://qupath.github.io/extension-catalog-model/).
-You will need to create a JSON file containing specific information about your extension and host it on a dedicated GitHub repository.
-Once the catalog is created, any user will be able to easily install your catalog by:
-
-* Opening QuPath's extension manager by clicking on `Extensions` -> `Manage extensions` in QuPath.
-* Adding the URL to your catalog by clicking on `Manage extension catalogs` -> `Add` in the extension manager.
-* Clicking on the `+` symbol next to your extension in the extension manager.
-
-QuPath will then make it easy to manage your extension and automatically inform users when an update is available.
-
-### Replace this readme
-
-Don't forget to replace the contents of this readme with your own!
-
-
-## Getting help
-
-For questions about QuPath and/or creating new extensions, please use the forum at https://forum.image.sc/tag/qupath
-
-------
+Every GUI run logs the exact script for that run to the Workflow tab, so you
+can also just configure it once in the dialog and copy the generated script
+from there.
 
 ## License
 
-This is just a template, you're free to use it however you like.
-You can treat the contents of *this repository only* as being under [the Unlicense](https://unlicense.org) (except for the Gradle wrapper, which has its own license included).
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 
 
-If you use it to create a new QuPath extension, I'd strongly encourage you to select a suitable open-source license for the extension.
-
-Note that *QuPath itself* is available under the GPL, so you do have to abide by those terms: see https://github.com/qupath/qupath for more.
+**Transparency Notice regarding AI Generation:**
+This extension was conceptually architected by a human and relies on QuPath's core APIs, but the boilerplate syntax and specific script implementations were heavily assisted by generative AI (Claude). Because AI-generated code currently resides in a legal grey area regarding human authorship, the MIT license applied here strictly covers the human arrangement, architectural choices, and integration. The code is provided strictly "AS IS" with absolutely no warranties.
